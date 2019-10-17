@@ -12,7 +12,6 @@ see (https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1003
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy.integrate
-from scipy.stats._tukeylambda_stats import tukeylambda_variance
 
 class LinearDynamicalSystem():
     '''
@@ -85,8 +84,8 @@ class LinearDynamicalSystem():
         treated as 0.  
         '''
         
-        # if input valid, append to end of input field, otherwise
-        # append 0
+        # if input valid, change input field, otherwise
+        # leave as 0
         if (u is not None and len(u) == len(self.u)):
             self.u   = u
         else:
@@ -128,6 +127,7 @@ class Decoder():
         ''' Return the estimate of the state variable from the network activity firing rate r '''
         assert(self._network is not None), "Cannot readout from decoder because it is not attached to a network."
         return self.G @ self._network.r
+
 class NoiseSource():
     ''' 
     Creates a Noise generator object with properties specified by user. To get the noise
@@ -140,20 +140,25 @@ class NoiseSource():
     mu: (scalar) mean of Gaussian distribution 
     
     sigma: (scalar) standard deviation of the Gaussian distribution (sqrt(Variance))
+    
+    N: (scalar) the number of random samples to return in vector form
     ''' 
-    def __init__(self, mu = 0, sigma = 1):
+    def __init__(self, mu = 0, sigma = 1, N = 1):
         '''Create a noise generator object) Assumes inputs are both scalars. '''
         self._mu = mu
         self._sigma = sigma
+        self._N = N
     
     def draw_noise(self):
         ''' Draw a sample from the specified noise distribution, currently gaussian '''
-        return np.random.normal(self._mu, self._sigma)
+
+        return np.random.normal(self._mu, self._sigma, self._N)
     
 class Network():
     '''
     A network implements a PCF neural network. The network takes a linear dynamical system, a decoder, and
     a noise source, and implements the LSD in a spiking neural network which can be read out by the decoder.  
+    
         
     ---------------- Initial Arguments: ----------------------------------------------------------------------------------------
     dec: (Decoder Object) instantiated decoder matrix to be attached to the network
@@ -163,6 +168,10 @@ class Network():
     noise_src: (NoiseSource Object) instantiated noise source that the network draws from.
     
     N: (scalar) number of neurons comprising the network
+    
+    v: (scalar) linear regularization parameter
+    
+    m: (scalar) quadratic regularization parameter
     
     lambda_v: (scalar) leak voltage specifying membrane potential decay rate
     
@@ -185,17 +194,23 @@ class Network():
     S: (N numpy array) spike raster containing time of last spike for each neuron (initially 0 vector)
     '''
     
-    def __init__(self, decoder, lds, noise_src, N, lambda_v, sigma_v, thres_v, reset_v):
+    def __init__(self, decoder, lds, noise_src, N,  v, m, lambda_v, sigma_v, thres_v, reset_v):
         ''' 
         Initialize the neural network according to the PCF equations specified in the paper listed at top of document.
         Check to ensure that the decoder matrix agrees in shape with the state vector, then attach to decoder matrix
         '''
         
         self.N = N
+        self.v = v
+        self.m = m
         self._lambda_v = lambda_v
         self._sigma_v = sigma_v
         
-
+        assert(len(thresh_v) == N), "Threshold voltages supplied should be a vector of %i elements, but contained %i" %(N, len(thresh_v))
+        assert(len(reset_v) == N), "Reset voltages supplied should be a vector of %i elements, but contained %i" %(N, len(reset_v))
+        self._thresh_v = thres_v
+        self._reset_v = reset_v
+        
         self._dec = decoder
         assert(decoder.G.shape[0] == lds.x.size), "Could not attach decoder to network:"\
         " the number of decoder matrix rows (%i) does not match the number of LDS state variables (%i)" %(decoder.G.shape[0], lds.x.size)
@@ -203,23 +218,101 @@ class Network():
 
         self._lds = lds
         self._noise_src = noise_src
+        
+        self._derive_kernels()
                 
-        #derive connectivity matrix
+        self.V = np.zeros((self.N,))
+        self.r = np.zeros((self.N,))
+        self.S = np.ones((self.N,))
+    
+    
+    def _derive_kernels(self):
+        ''' Derive the fast and slow network kernels. called only once for efficiency'''
+  
+        self._w_fast = self._dec.G.T @ self._dec.G + self.m * self._dec.lambda_d**2*np.eye(self.N)
+        self._w_slow = self._dec.G.T @ (self._lds.A + self._dec.lambda_d * np.eye(self._lds.A.shape[0])) @ self._dec.G
+    
+    # helper functions for getting time-dependent connectivity kernel
+    def _h_d(self, tau):
+        ''' given a time tau, return the decay kernel h_d = exp(-lamba_d * t) '''
+        if tau >= 0:
+            return np.exp(-self._dec.lambda_d * tau)
+        else:
+            return 0    
+        
+    def _delta(self, tau):
+        ''' given a time  (scalar) tau, return delta(tau) '''
+        if (tau == 0): 
+            return 1
+        else:
+            return 0
+        
+
+        
+    def get_w_kernel(self, tau):
+        ''' compute the time-dependent connectivity kernel given time tau'''
+        return self._w_slow * self._h(tau) - self._w_fast * self._delta(tau) 
+    
+    def _r_dot(self, t , r ):
+        '''
+        Get the derivative of the firing rate. the t and r  arguments are so that this function 
+        signature conforms to requirements to be called by scipy's solve_ivp integrator and are 
+        not explicitly used in this code
+        '''
+        return -self._dec.lambda_d * self.r + self._dec.lambda_d * self.S
+        
+    # do we update spikes first adn then calc derivatives or calc derivatives and update spikes? 
+    def _V_dot(self, t, v):
+        '''
+        Get the derivative of the voltage (membrane potential).  The arguments
+        are not used for the same reason as in _r_dot() 
+        '''
+
+        # noise makes function -very- slow
+        
+        return -self._lambda_v * self.V   + self._dec.G.T @ (self._lds.B @ self._lds.u) + self._sigma_v * self._noise_src.draw_noise()
+        
+
+        
+    def update(self, u = None):
+        ''' Update the neural network to the next time step '''
         
         
-    def get_w_kernel(self):
-        ''' derive the connectivity kernel W '''
-            
+        # integrate and advance V and r
+        self.r = scipy.integrate.solve_ivp(self._r_dot, (self._lds.t, self._lds.t + self._lds.dt), self.r).y[:,-1]
         
-        # declare voltages and spike rates
+        self.V = scipy.integrate.solve_ivp(self._V_dot, (self._lds.t, self._lds.t + self._lds.dt), self.V).y[:,-1]
         
-        # declare spike raster
+        # update spike times S
+        self.S[self.S >= self._thresh_v] = 1
+        self.S[self.S < self._thresh_v] = 0 
+        
+         
+        self._lds.update(u) 
+        
+        
+#    self.x = scipy.integrate.solve_ivp(self.get_derivative, (self.t, self.t + self.dt), self.x).y[:,-1]
+
+# why python slow?
+# could be object access
+    # replace all objects with constants
+# could be math operation
+# could  be integration
+# could be derivative function ( must be since r has the same object access same operations, etc in calling function)
+
+# results so far: 
+    # when noise removed function normal speed
+    # when noise returns 0 function normal speed
+    # conclusion: something about the noise makes the entire integration algorithm run very slowly
+    # observation: changing size of sigma_v changes integration speed!
      
 # Network Parameters
 N = 400         # number of neurons
+v =   10**-5    # linear regularization parameter 
+m = 10**-6      # quadratic regularizatino parameter
 lambda_v = 20   # leak voltage rate (Hz)
 sigma_v = 0     # voltage noise gain (Hz)
-thresh_v = -30 * np.ones((N,))   # threshold potential of N neurons (mV)
+thresh_v = -30* np.ones((N,))   # threshold potential of N neurons (mV)
 reset_v  = -80 * np.ones((N,))   # reset potential of N neurons (mV)
 
 
@@ -241,12 +334,26 @@ lambda_d = 1
 dec = Decoder(G, lambda_d)
 
 # initialize noise source
-noise_src = NoiseSource()
+noise_src = NoiseSource(N = N)
     
 
 # initialize network
 
+net = Network(dec, lds, noise_src, N, v, m, lambda_v, sigma_v, thresh_v, reset_v)
 
-net = Network(dec, lds, noise_src, N, lambda_v, sigma_v, thresh_v, reset_v)
+for d in dir(net):
+    if (d[-1] is not "_"):
+        print ("%s: " % d, getattr(net, d))
 
-        
+ts = np.arange(1000)
+rrs = np.zeros(ts.shape)
+for idx,t in enumerate(ts):
+    if idx == 2:
+        net.S  = np.zeros((N,))
+    rrs[idx] = np.max(net.r)
+    net.update()
+    print(t)
+plt.plot(ts, rrs)
+plt.show()
+
+
