@@ -12,6 +12,7 @@ see (https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1003
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy.integrate
+import queue
 
 class LinearDynamicalSystem():
     '''
@@ -193,7 +194,7 @@ class Network():
     
     S: (N numpy array) spike raster containing time of last spike for each neuron (initially 0 vector)
     '''
-    
+
     def __init__(self, decoder, lds, noise_src, N,  v, m, lambda_v, sigma_v, thres_v, reset_v):
         ''' 
         Initialize the neural network according to the PCF equations specified in the paper listed at top of document.
@@ -221,10 +222,13 @@ class Network():
         
         self._derive_kernels()
                 
-        self.V = np.zeros((self.N,))
-        self.r = np.zeros((self.N,))
-        self.S = np.ones((self.N,))
-    
+        self.V = np.random.randn(self.N,) + reset_v
+        self.r = np.zeros((N,))
+        self.S = []
+        for i in np.arange(N):
+            self.S.append([0])
+        self.last_spikes = np.zeros((N,))
+            
     
     def _derive_kernels(self):
         ''' Derive the fast and slow network kernels. called only once for efficiency'''
@@ -242,6 +246,9 @@ class Network():
         
     def _delta(self, tau):
         ''' given a time  (scalar) tau, return delta(tau) '''
+        # for tau vector
+        
+        # for tau scalar
         if (tau == 0): 
             return 1
         else:
@@ -259,7 +266,8 @@ class Network():
         signature conforms to requirements to be called by scipy's solve_ivp integrator and are 
         not explicitly used in this code
         '''
-        return -self._dec.lambda_d * self.r + self._dec.lambda_d * self.S
+        
+        return -self._dec.lambda_d * self.r + self._dec.lambda_d * self.last_spikes
         
     # do we update spikes first adn then calc derivatives or calc derivatives and update spikes? 
     def _V_dot(self, t, v):
@@ -270,9 +278,19 @@ class Network():
 
         # noise makes function -very- slow
         
-        return -self._lambda_v * self.V   + self._dec.G.T @ (self._lds.B @ self._lds.u) + self._sigma_v * self._noise_src.draw_noise()
+        return (
+            -self._lambda_v * self.V   
+            + self._dec.G.T @ (self._lds.B @ self._lds.u) 
+            + self._sigma_v * self._noise_src.draw_noise()
+           # + get_w_kernel()
+          + 10
+            )
         
-
+    def _spike(self):
+        ''' update spike rasters '''
+        spikes = self.V >= self._thresh_v
+        self.last_spikes = [s[-1] for s in self.S]
+        [self.S[i].append(self._lds.t) for i in np.arange(self.N) if spikes[i] ]
         
     def update(self, u = None):
         ''' Update the neural network to the next time step '''
@@ -284,21 +302,13 @@ class Network():
         self.V = scipy.integrate.solve_ivp(self._V_dot, (self._lds.t, self._lds.t + self._lds.dt), self.V).y[:,-1]
         
         # update spike times S
-        self.S[self.S >= self._thresh_v] = 1
-        self.S[self.S < self._thresh_v] = 0 
-        
+        self._spike()
+
+
          
         self._lds.update(u) 
         
-        
-#    self.x = scipy.integrate.solve_ivp(self.get_derivative, (self.t, self.t + self.dt), self.x).y[:,-1]
 
-# why python slow?
-# could be object access
-    # replace all objects with constants
-# could be math operation
-# could  be integration
-# could be derivative function ( must be since r has the same object access same operations, etc in calling function)
 
 # results so far: 
     # when noise removed function normal speed
@@ -314,6 +324,13 @@ lambda_v = 20   # leak voltage rate (Hz)
 sigma_v = 0     # voltage noise gain (Hz)
 thresh_v = -30* np.ones((N,))   # threshold potential of N neurons (mV)
 reset_v  = -80 * np.ones((N,))   # reset potential of N neurons (mV)
+
+
+
+# fast coeffs and slow coeffs
+
+# 
+
 
 
 
@@ -350,9 +367,11 @@ rrs = np.zeros(ts.shape)
 for idx,t in enumerate(ts):
     if idx == 2:
         net.S  = np.zeros((N,))
-    rrs[idx] = np.max(net.r)
+    rrs[idx] = (net.V[0])
     net.update()
     print(t)
+
+print(net.S[0])    
 plt.plot(ts, rrs)
 plt.show()
 
