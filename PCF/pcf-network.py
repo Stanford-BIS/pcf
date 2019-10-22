@@ -222,16 +222,14 @@ class Network():
         
         self._derive_kernels()
                 
-        self.V = np.random.randn(self.N,) + reset_v
+        self.V = 0*np.random.randn(self.N,) + reset_v
         self.r = np.zeros((N,))
-        self.S = []
-        for i in np.arange(N):
-            self.S.append([0])
-        self.last_spikes = np.zeros((N,))
+        self.S = [[0 for i in np.arange(1)] for j in np.arange(N)]
+        self.last_spikes =   np.zeros((N,))
             
     
     def _derive_kernels(self):
-        ''' Derive the fast and slow network kernels. called only once for efficiency'''
+        ''' Derive the fast and slow network kernels.'''
   
         self._w_fast = self._dec.G.T @ self._dec.G + self.m * self._dec.lambda_d**2*np.eye(self.N)
         self._w_slow = self._dec.G.T @ (self._lds.A + self._dec.lambda_d * np.eye(self._lds.A.shape[0])) @ self._dec.G
@@ -244,97 +242,71 @@ class Network():
         else:
             return 0    
         
-    def _delta(self, tau):
-        ''' given a time  (scalar) tau, return delta(tau) '''
-        # for tau vector
-        
-        # for tau scalar
-        if (tau == 0): 
-            return 1
-        else:
-            return 0
-        
-
-        
     def get_w_kernel(self, tau):
         ''' compute the time-dependent connectivity kernel given time tau'''
-        return self._w_slow * self._h(tau) - self._w_fast * self._delta(tau) 
+        fast_term = -self._w_fast @ np.isclose(0, self.last_spikes - tau )
+        return fast_term
+        
+        slow_term = np.zeros((N,))
+        for i in np.arange(N):
+            slow_term[i] = np.sum(np.exp(-self._dec.lambda_d *(t - self.S[i])))
+             
+        
+        
+        return slow_term - fast_term
+    
+     
     
     def _r_dot(self, t , r ):
         '''
-        Get the derivative of the firing rate. the t and r  arguments are so that this function 
-        signature conforms to requirements to be called by scipy's solve_ivp integrator and are 
-        not explicitly used in this code
+        Get the derivative of the firing rate
         '''
+        return -self._dec.lambda_d * r + self._dec.lambda_d * np.isclose(0,self.last_spikes - t)
         
-        return -self._dec.lambda_d * self.r + self._dec.lambda_d * self.last_spikes
-        
-    # do we update spikes first adn then calc derivatives or calc derivatives and update spikes? 
+ 
     def _V_dot(self, t, v):
         '''
-        Get the derivative of the voltage (membrane potential).  The arguments
-        are not used for the same reason as in _r_dot() 
+        Get the derivative of the voltage (membrane potential). 
         '''
 
         # noise makes function -very- slow
         
         return (
-            -self._lambda_v * self.V   
+            -self._lambda_v * v  
             + self._dec.G.T @ (self._lds.B @ self._lds.u) 
             + self._sigma_v * self._noise_src.draw_noise()
-           # + get_w_kernel()
-          + 10
+            + self.get_w_kernel(t)
             )
         
     def _spike(self):
-        ''' update spike rasters '''
+        ''' 
+        update spike rasters.
+        If the given neurons voltage threshold is reached, it is set to
+        spike in the next time frame (i.e. when update is called next), 
+        so we add dt'''
         spikes = self.V >= self._thresh_v
-        self.last_spikes = [s[-1] for s in self.S]
-        [self.S[i].append(self._lds.t) for i in np.arange(self.N) if spikes[i] ]
+        curr_time = self._lds.t + self._lds.dt
+        for i in np.arange(self.N):
+            if spikes[i]:
+                self.S[i].append(curr_time)
+                self.last_spikes[i] = curr_time
         
     def update(self, u = None):
         ''' Update the neural network to the next time step '''
-        
-        
-        # integrate and advance V and r
+
+        # advance network in time then check for spikes
         self.r = scipy.integrate.solve_ivp(self._r_dot, (self._lds.t, self._lds.t + self._lds.dt), self.r).y[:,-1]
-        
         self.V = scipy.integrate.solve_ivp(self._V_dot, (self._lds.t, self._lds.t + self._lds.dt), self.V).y[:,-1]
-        
-        # update spike times S
         self._spike()
-
-
-         
+        # update underlying lds which defines time for the simulation
         self._lds.update(u) 
-        
-
-
-# results so far: 
-    # when noise removed function normal speed
-    # when noise returns 0 function normal speed
-    # conclusion: something about the noise makes the entire integration algorithm run very slowly
-    # observation: changing size of sigma_v changes integration speed!
      
-# Network Parameters
-N = 400         # number of neurons
-v =   10**-5    # linear regularization parameter 
-m = 10**-6      # quadratic regularizatino parameter
-lambda_v = 20   # leak voltage rate (Hz)
-sigma_v = 0     # voltage noise gain (Hz)
-thresh_v = -30* np.ones((N,))   # threshold potential of N neurons (mV)
-reset_v  = -80 * np.ones((N,))   # reset potential of N neurons (mV)
-
-
-
-# fast coeffs and slow coeffs
-
-# 
-
-
-
-
-
+     
+     
+     
+     
+     
+     
 # configure linear dynamical system
 A = np.zeros((2,2))
 A[0,1] = -1
@@ -342,12 +314,23 @@ A[1,0] = 1
 x0 = np.asarray([.2, .4])
 u0 = np.asarray([0])
 B  = np.zeros((2,1))
-dt = .01
+dt = .0001 # time step (S)
 lds = LinearDynamicalSystem(x0, A, u0, B, dt)
 
+# Network Parameters
+N = 400         # number of neurons
+v = 10**-5    # linear regularization parameter 
+m = 10**-6     # quadratic regularizatino parameter
+lambda_v = 20   # leak voltage rate (Hz)
+sigma_v = 0     # voltage noise gain (Hz)
+thresh_v = -30 * np.ones((N,)) *10**-3  # threshold potential of N neurons (V)
+reset_v  = -80 * np.ones((N,)) *10**-3  # reset potential of N neurons (V)
+
 # configure decoder
-G = np.zeros((2, N))
-lambda_d = 1
+G = np.ones((2, N)) * .1
+G[0,:] = G[0,:] = -.1
+G[:,int(N/2):] = - G[:,int(N/2):]
+lambda_d = 10 
 dec = Decoder(G, lambda_d)
 
 # initialize noise source
@@ -355,23 +338,21 @@ noise_src = NoiseSource(N = N)
     
 
 # initialize network
-
 net = Network(dec, lds, noise_src, N, v, m, lambda_v, sigma_v, thresh_v, reset_v)
 
 for d in dir(net):
     if (d[-1] is not "_"):
         print ("%s: " % d, getattr(net, d))
 
-ts = np.arange(1000)
+ts = np.arange(200)*dt
 rrs = np.zeros(ts.shape)
 for idx,t in enumerate(ts):
-    if idx == 2:
-        net.S  = np.zeros((N,))
-    rrs[idx] = (net.V[0])
+    rrs[idx] = net.r[0]
+    
     net.update()
-    print(t)
 
-print(net.S[0])    
+    print("%i : %f"%(t/dt, t))
+
 plt.plot(ts, rrs)
 plt.show()
 
