@@ -47,6 +47,7 @@ class LinearDynamicalSystem():
     u: (L numpy array) input vector at current time 
     
     '''
+    
     def __init__(self, init_state, A, init_input, B, dt = .001):
         '''
         Initialize the Linear Dynamical System. If there are any defaults, ensure they have appropriate
@@ -194,6 +195,9 @@ class Network():
     
     S: (N numpy array) spike raster containing time of last spike for each neuron (initially 0 vector)
     '''
+    
+    ABS_REFRAC_PERIOD = .001  #Minimum refractory period in S between consecutive spikes of a neuron
+
 
     def __init__(self, decoder, lds, noise_src, N,  v, m, lambda_v, sigma_v, thres_v, reset_v):
         ''' 
@@ -283,11 +287,12 @@ class Network():
         update spike rasters.
         If the given neurons voltage threshold is reached, it is set to
         spike in the next time frame (i.e. when update is called next), 
-        so we add dt'''
+        so we add dt. A spike can only occur if after the absolute refractory
+        period, defined as a class constant, has elapsed'''
         spikes = self.V >= self._thresh_v
         curr_time = self._lds.t + self._lds.dt
         for i in np.arange(self.N):
-            if spikes[i]:
+            if spikes[i] and curr_time - self.last_spikes[i] >= Network.ABS_REFRAC_PERIOD:
                 self.S[i].append(curr_time)
                 self.last_spikes[i] = curr_time
         
@@ -344,10 +349,10 @@ for d in dir(net):
     if (d[-1] is not "_"):
         print ("%s: " % d, getattr(net, d))
 
-ts = np.arange(200)*dt
+ts = np.arange(10000)*dt
 rrs = np.zeros(ts.shape)
 for idx,t in enumerate(ts):
-    rrs[idx] = net.r[0]
+    rrs[idx] = net.V[0]
     
     net.update()
 
