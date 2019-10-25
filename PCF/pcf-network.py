@@ -226,17 +226,33 @@ class Network():
         
         self._derive_kernels()
                 
-        self.V = 0*np.random.randn(self.N,) + reset_v
+        self.V = .01*np.ones((N,))
         self.r = np.zeros((N,))
         self.S = [[0 for i in np.arange(1)] for j in np.arange(N)]
-        self.last_spikes =   np.zeros((N,))
             
     
     def _derive_kernels(self):
-        ''' Derive the fast and slow network kernels.'''
-  
-        self._w_fast = self._dec.G.T @ self._dec.G + self.m * self._dec.lambda_d**2*np.eye(self.N)
-        self._w_slow = self._dec.G.T @ (self._lds.A + self._dec.lambda_d * np.eye(self._lds.A.shape[0])) @ self._dec.G
+        '''
+        Derive the fast and slow network kernels and 
+        use these to compute the spiking thresholds
+        '''
+        
+        ld = self._dec.lambda_d
+        nu = self.v
+        mu = self.m
+        G  = self._dec.G
+        A  = self._lds.A
+        # solve for neuron scaling parameters
+        self._w_fast = G.T @ G + mu * ld**2 * np.eye(self.N)
+        self._w_slow = G.T @ (A + ld * np.eye(A.shape[0])) @ G
+        
+        # calculate thresholds 
+
+        for i in np.arange(self.N):
+            self._thresh_v[i] = (
+                (nu * ld) + (mu * ld**2) + (G[:,i].T @ G[:,i])
+                ) / 2  
+        
     
     # helper functions for getting time-dependent connectivity kernel
     def _h_d(self, tau):
@@ -248,27 +264,19 @@ class Network():
         
     def get_w_kernel(self, tau):
         ''' compute the time-dependent connectivity kernel given time tau'''
-        fast_term = -self._w_fast @ np.isclose(0, self.last_spikes - tau )
-        return fast_term
-        
-        slow_term = np.zeros((N,))
-        for i in np.arange(N):
-            slow_term[i] = np.sum(np.exp(-self._dec.lambda_d *(t - self.S[i])))
-             
+
         
         
         return slow_term - fast_term
     
-     
-    
-    def _r_dot(self, t , r ):
+    def _r_dot(self):
         '''
         Get the derivative of the firing rate
         '''
-        return -self._dec.lambda_d * r + self._dec.lambda_d * np.isclose(0,self.last_spikes - t)
+        return -self._dec.lambda_d * self.r
         
  
-    def _V_dot(self, t, v):
+    def _V_dot(self):
         '''
         Get the derivative of the voltage (membrane potential). 
         '''
@@ -276,10 +284,11 @@ class Network():
         # noise makes function -very- slow
         
         return (
-            -self._lambda_v * v  
+            -self._lambda_v * self.V  
             + self._dec.G.T @ (self._lds.B @ self._lds.u) 
             + self._sigma_v * self._noise_src.draw_noise()
-            + self.get_w_kernel(t)
+            + self._w_slow @ self.r # slow kernel contribution  
+            # fast kernel is implemented as instantaneous voltage drop inside _spike method
             )
         
     def _spike(self):
@@ -289,29 +298,37 @@ class Network():
         spike in the next time frame (i.e. when update is called next), 
         so we add dt. A spike can only occur if after the absolute refractory
         period, defined as a class constant, has elapsed'''
+        
+        # helper function that returns a list of indices of cells that have spiked
+        def get_spiked_indices(self):
+            ''' 
+            Helper function: retrieve a list of indices of cells that
+            have spiked.
+            '''
+            
+            
         spikes = self.V >= self._thresh_v
-        curr_time = self._lds.t + self._lds.dt
-        for i in np.arange(self.N):
-            if spikes[i] and curr_time - self.last_spikes[i] >= Network.ABS_REFRAC_PERIOD:
-                self.S[i].append(curr_time)
-                self.last_spikes[i] = curr_time
+        curr_time = self._lds.t
+        while (sum(spikes)):
+            spike_idxs = [i for i in np.arange(N) if spikes[i]]
+            i = np.random.choice(spike_idxs)    
+            self.S[i].append(curr_time) 
+            self.r[i] += self._dec.lambda_d
+            self.V += -self._w_fast[:,i]
+            spikes = self.V >= self._thresh_v
+
         
     def update(self, u = None):
         ''' Update the neural network to the next time step '''
 
         # advance network in time then check for spikes
-        self.r = scipy.integrate.solve_ivp(self._r_dot, (self._lds.t, self._lds.t + self._lds.dt), self.r).y[:,-1]
-        self.V = scipy.integrate.solve_ivp(self._V_dot, (self._lds.t, self._lds.t + self._lds.dt), self.V).y[:,-1]
+        self.r += self._lds.dt * self._r_dot()
+        self.V += self._lds.dt * self._V_dot()
         self._spike()
         # update underlying lds which defines time for the simulation
         self._lds.update(u) 
      
-     
-     
-     
-     
-     
-     
+         
 # configure linear dynamical system
 A = np.zeros((2,2))
 A[0,1] = -1
@@ -319,15 +336,16 @@ A[1,0] = 1
 x0 = np.asarray([.2, .4])
 u0 = np.asarray([0])
 B  = np.zeros((2,1))
-dt = .0001 # time step (S)
+B[0] = -1
+dt = .001 # time step (S)
 lds = LinearDynamicalSystem(x0, A, u0, B, dt)
 
 # Network Parameters
 N = 400         # number of neurons
 v = 10**-5    # linear regularization parameter 
 m = 10**-6     # quadratic regularizatino parameter
-lambda_v = 20   # leak voltage rate (Hz)
-sigma_v = 0     # voltage noise gain (Hz)
+lambda_v = .020   # leak voltage rate (Hz)
+sigma_v = .1     # voltage noise gain (Hz)
 thresh_v = -30 * np.ones((N,)) *10**-3  # threshold potential of N neurons (V)
 reset_v  = -80 * np.ones((N,)) *10**-3  # reset potential of N neurons (V)
 
@@ -335,6 +353,7 @@ reset_v  = -80 * np.ones((N,)) *10**-3  # reset potential of N neurons (V)
 G = np.ones((2, N)) * .1
 G[0,:] = G[0,:] = -.1
 G[:,int(N/2):] = - G[:,int(N/2):]
+G += .001*(np.random.random(G.shape)-.5)
 lambda_d = 10 
 dec = Decoder(G, lambda_d)
 
@@ -345,20 +364,26 @@ noise_src = NoiseSource(N = N)
 # initialize network
 net = Network(dec, lds, noise_src, N, v, m, lambda_v, sigma_v, thresh_v, reset_v)
 
-for d in dir(net):
-    if (d[-1] is not "_"):
-        print ("%s: " % d, getattr(net, d))
-
-ts = np.arange(10000)*dt
-rrs = np.zeros(ts.shape)
+ts = np.arange(1000)*dt
+readout = np.zeros((A.shape[1],len(ts)))
+actual   = np.zeros((A.shape[1],len(ts)))
+rs = np.zeros((len(ts),N))
+vs = np.zeros((len(ts),N))
 for idx,t in enumerate(ts):
-    rrs[idx] = net.V[0]
-    
+    rs[idx, :] = net.r
+    vs[idx, :] = net.V
+    readout[:,idx] = dec.readout()
+    actual[:, idx] = lds.x
     net.update()
 
     print("%i : %f"%(t/dt, t))
-
-plt.plot(ts, rrs)
+plt.figure()
+plt.imshow(rs)
+plt.show(block=False)
+plt.figure()
+plt.imshow(vs)
+#plt.scatter(readout[0,:],readout[1,:], label='decoded')
+#plt.scatter(actual[0,:],actual[1,:], label='actual')
+#plt.legend()
 plt.show()
-
 
